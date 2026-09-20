@@ -3,6 +3,7 @@ import { randomInt } from 'node:crypto';
 import 'dotenv/config';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import rateLimit from 'express-rate-limit';
 import { UAParser } from 'ua-parser-js';
 import { pool } from './db.js';
 
@@ -42,6 +43,38 @@ function isValidHttpUrl(value) {
     return false;
   }
 }
+// ---------- Rate limiting (per IP address) ----------
+
+const tooMany = (message) => ({ error: message });
+
+// Login/register: only failed attempts count, so normal use is never blocked
+// but password guessing is slowed down to 10 tries per 15 minutes.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  skipSuccessfulRequests: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: tooMany('Too many attempts. Try again in a few minutes.'),
+});
+
+// Creating links: 30 per 15 minutes
+const createLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: tooMany('Too many links created. Slow down.'),
+});
+
+// Redirects: generous, but stops one IP from hammering the database
+const redirectLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: tooMany('Too many requests. Slow down.'),
+});
 
 // ---------- Auth ----------
 
@@ -61,7 +94,7 @@ function requireAuth(req, res, next) {
   }
 }
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register',authLimiter, async (req, res) => {
   const { email, password } = req.body ?? {};
 
   if (typeof email !== 'string' || email.length > 255 || !EMAIL_RE.test(email.trim())) {
@@ -88,7 +121,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login',authLimiter, async (req, res) => {
   const { email, password } = req.body ?? {};
   if (typeof email !== 'string' || typeof password !== 'string') {
     return res.status(400).json({ error: 'Provide email and password.' });
@@ -118,7 +151,7 @@ app.post('/api/auth/login', async (req, res) => {
 // ---------- Links ----------
 
 // Create a short link (login required)
-app.post('/api/links', requireAuth, async (req, res) => {
+app.post('/api/links',createLimiter, requireAuth, async (req, res) => {
   const { url } = req.body ?? {};
 
   if (typeof url !== 'string' || url.length > 2048 || !isValidHttpUrl(url)) {
@@ -147,7 +180,7 @@ app.post('/api/links', requireAuth, async (req, res) => {
 });
 
 // List the logged-in user's links with click counts
-app.get('/api/links', requireAuth, async (req, res) => {
+app.get('/api/links', createLimiter, requireAuth, async (req, res) => {
   try {
     const [rows] = await pool.execute(
       `SELECT l.code, l.original_url AS originalUrl, l.created_at AS createdAt, COUNT(c.id) AS clicks
@@ -235,7 +268,7 @@ app.get('/api/links/:code/stats', requireAuth, async (req, res) => {
 });
 
 // Redirect: must be defined AFTER the /api routes
-app.get('/:code', async (req, res) => {
+app.get('/:code',redirectLimiter, async (req, res) => {
   const { code } = req.params;
 
   if (!/^[0-9A-Za-z]{1,10}$/.test(code)) {
