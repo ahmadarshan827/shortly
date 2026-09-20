@@ -1,6 +1,7 @@
 import express from 'express';
 import { randomInt } from 'node:crypto';
 import 'dotenv/config';
+import { UAParser } from 'ua-parser-js';
 import { pool } from './db.js';
 
 const app = express();
@@ -53,6 +54,74 @@ app.post('/api/links', async (req, res) => {
     }
   }
   res.status(500).json({ error: 'Could not generate a unique code, please retry.' });
+});
+
+// Stats for one link: total clicks, clicks per day, devices, browsers, top referrers
+app.get('/api/links/:code/stats', async (req, res) => {
+  const { code } = req.params;
+
+  try {
+    const [links] = await pool.execute(
+      'SELECT id, original_url, created_at FROM links WHERE code = ?',
+      [code]
+    );
+    if (links.length === 0) {
+      return res.status(404).json({ error: 'Link not found.' });
+    }
+    const link = links[0];
+
+    const [[{ total }]] = await pool.execute(
+      'SELECT COUNT(*) AS total FROM clicks WHERE link_id = ?',
+      [link.id]
+    );
+
+    const [perDay] = await pool.execute(
+      `SELECT DATE_FORMAT(clicked_at, '%Y-%m-%d') AS date, COUNT(*) AS clicks
+       FROM clicks
+       WHERE link_id = ? AND clicked_at >= NOW() - INTERVAL 30 DAY
+       GROUP BY date
+       ORDER BY date`,
+      [link.id]
+    );
+
+    const [referrers] = await pool.execute(
+      `SELECT referrer, COUNT(*) AS clicks
+       FROM clicks
+       WHERE link_id = ? AND referrer IS NOT NULL
+       GROUP BY referrer
+       ORDER BY clicks DESC
+       LIMIT 5`,
+      [link.id]
+    );
+
+    // Group by user agent in SQL (few distinct values), then parse each one in JS
+    const [agents] = await pool.execute(
+      'SELECT user_agent, COUNT(*) AS clicks FROM clicks WHERE link_id = ? GROUP BY user_agent',
+      [link.id]
+    );
+    const devices = {};
+    const browsers = {};
+    for (const { user_agent, clicks } of agents) {
+      const ua = UAParser(user_agent || '');
+      const device = ua.device.type || 'desktop'; // the parser leaves type empty for desktops
+      const browser = ua.browser.name || 'Unknown';
+      devices[device] = (devices[device] || 0) + clicks;
+      browsers[browser] = (browsers[browser] || 0) + clicks;
+    }
+
+    res.json({
+      code,
+      originalUrl: link.original_url,
+      totalClicks: total,
+      clicksPerDay: perDay,
+      devices,
+      browsers,
+      topReferrers: referrers,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
 });
 
 // Redirect: must be defined AFTER the /api routes
