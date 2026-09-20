@@ -56,7 +56,6 @@ app.post('/api/links', async (req, res) => {
 });
 
 // Redirect: must be defined AFTER the /api routes
-// Redirect: must be defined AFTER the /api routes
 app.get('/:code', async (req, res) => {
   const { code } = req.params;
 
@@ -76,16 +75,15 @@ app.get('/:code', async (req, res) => {
 
     const link = rows[0];
 
-    // Record the click
-    await pool.execute(
-      `INSERT INTO clicks (link_id, referrer, user_agent)
-       VALUES (?, ?, ?)`,
+    // Log the click in the background: don't wait for it, and never let it break the redirect
+    pool.execute(
+      'INSERT INTO clicks (link_id, referrer, user_agent) VALUES (?, ?, ?)',
       [
         link.id,
-        req.get('referer') || null,
-        req.get('user-agent') || null,
+        req.get('referer')?.slice(0, 2048) || null,
+        req.get('user-agent')?.slice(0, 512) || null,
       ]
-    );
+    ).catch((err) => console.error('Failed to log click:', err));
 
     // 302 = temporary redirect
     res.redirect(302, link.original_url);
