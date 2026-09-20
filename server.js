@@ -1,6 +1,8 @@
 import express from 'express';
 import { randomInt } from 'node:crypto';
 import 'dotenv/config';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import { UAParser } from 'ua-parser-js';
 import { pool } from './db.js';
 
@@ -9,6 +11,17 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('Missing JWT_SECRET in .env');
+  process.exit(1);
+}
+
+// Used to keep login timing the same whether or not the email exists
+const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 10);
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'; // 62 chars
 const CODE_LENGTH = 7; // 62^7 is about 3.5 trillion possible codes
@@ -30,8 +43,82 @@ function isValidHttpUrl(value) {
   }
 }
 
-// Create a short link
-app.post('/api/links', async (req, res) => {
+// ---------- Auth ----------
+
+// Reads "Authorization: Bearer <token>", verifies it, and sets req.userId
+function requireAuth(req, res, next) {
+  const header = req.get('authorization') || '';
+  const [scheme, token] = header.split(' ');
+  if (scheme !== 'Bearer' || !token) {
+    return res.status(401).json({ error: 'Login required.' });
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.userId = Number(payload.sub);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token.' });
+  }
+}
+
+app.post('/api/auth/register', async (req, res) => {
+  const { email, password } = req.body ?? {};
+
+  if (typeof email !== 'string' || email.length > 255 || !EMAIL_RE.test(email.trim())) {
+    return res.status(400).json({ error: 'Provide a valid email.' });
+  }
+  // bcrypt only uses the first 72 bytes, so we cap the length
+  if (typeof password !== 'string' || password.length < 8 || password.length > 72) {
+    return res.status(400).json({ error: 'Password must be 8 to 72 characters.' });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(password, 10);
+    const [result] = await pool.execute(
+      'INSERT INTO users (email, password_hash) VALUES (?, ?)',
+      [email.trim().toLowerCase(), passwordHash]
+    );
+    res.status(201).json({ id: result.insertId, email: email.trim().toLowerCase() });
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: 'Email already registered.' });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body ?? {};
+  if (typeof email !== 'string' || typeof password !== 'string') {
+    return res.status(400).json({ error: 'Provide email and password.' });
+  }
+
+  try {
+    const [rows] = await pool.execute(
+      'SELECT id, password_hash FROM users WHERE email = ?',
+      [email.trim().toLowerCase()]
+    );
+    const user = rows[0];
+
+    // Always run bcrypt.compare, even for unknown emails, so timing doesn't reveal which emails exist
+    const ok = await bcrypt.compare(password, user ? user.password_hash : DUMMY_HASH);
+    if (!user || !ok) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+
+    const token = jwt.sign({ sub: String(user.id) }, JWT_SECRET, { expiresIn: '1h' });
+    res.json({ token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
+// ---------- Links ----------
+
+// Create a short link (login required)
+app.post('/api/links', requireAuth, async (req, res) => {
   const { url } = req.body ?? {};
 
   if (typeof url !== 'string' || url.length > 2048 || !isValidHttpUrl(url)) {
@@ -43,7 +130,10 @@ app.post('/api/links', async (req, res) => {
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = generateCode();
     try {
-      await pool.execute('INSERT INTO links (code, original_url) VALUES (?, ?)', [code, url]);
+      await pool.execute(
+        'INSERT INTO links (code, original_url, user_id) VALUES (?, ?, ?)',
+        [code, url, req.userId]
+      );
       return res.status(201).json({ code, shortUrl: `${BASE_URL}/${code}`, originalUrl: url });
     } catch (err) {
       if (err.code !== 'ER_DUP_ENTRY') {
@@ -56,15 +146,35 @@ app.post('/api/links', async (req, res) => {
   res.status(500).json({ error: 'Could not generate a unique code, please retry.' });
 });
 
-// Stats for one link: total clicks, clicks per day, devices, browsers, top referrers
-app.get('/api/links/:code/stats', async (req, res) => {
+// List the logged-in user's links with click counts
+app.get('/api/links', requireAuth, async (req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT l.code, l.original_url AS originalUrl, l.created_at AS createdAt, COUNT(c.id) AS clicks
+       FROM links l
+       LEFT JOIN clicks c ON c.link_id = l.id
+       WHERE l.user_id = ?
+       GROUP BY l.id
+       ORDER BY l.created_at DESC`,
+      [req.userId]
+    );
+    res.json(rows.map((r) => ({ ...r, shortUrl: `${BASE_URL}/${r.code}` })));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
+// Stats for one of your links: total clicks, clicks per day, devices, browsers, top referrers
+app.get('/api/links/:code/stats', requireAuth, async (req, res) => {
   const { code } = req.params;
 
   try {
     const [links] = await pool.execute(
-      'SELECT id, original_url, created_at FROM links WHERE code = ?',
-      [code]
+      'SELECT id, original_url, created_at FROM links WHERE code = ? AND user_id = ?',
+      [code, req.userId]
     );
+    // Someone else's link looks the same as a missing one, so codes can't be probed
     if (links.length === 0) {
       return res.status(404).json({ error: 'Link not found.' });
     }
